@@ -1,0 +1,139 @@
+# Builds and checks every push and pull request on Linux and macOS. Pushes to
+# main also publish ghcr.io/rpendleton/php-scan; tags v* publish a release.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Checks and builds each platform, and uploads one artifact per platform on
+  # every run, so any run's page has binaries to download. vet runs for each
+  # platform; the unit tests only where they can run (linux/amd64).
+  build:
+    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        os: [linux, darwin]
+        arch: [amd64, arm64]
+    env:
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.arch }}
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test ./...
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'
+      - name: build
+        run: |
+          version=dev-${GITHUB_SHA::7}
+          [ "$GITHUB_REF_TYPE" != tag ] || version=$GITHUB_REF_NAME
+          go build -trimpath -ldflags "-s -X main.version=$version" \
+            -o "php-scan-$GOOS-$GOARCH" .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: php-scan-${{ matrix.os }}-${{ matrix.arch }}
+          path: php-scan-${{ matrix.os }}-${{ matrix.arch }}
+          if-no-files-found: error
+
+  # A scan of the runner with the linux build.
+  test-linux:
+    needs: build
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: php-scan-linux-*
+          merge-multiple: true
+      - name: scan the runner
+        run: |
+          bin=./php-scan-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+          chmod +x "$bin"
+          set +e
+          sudo "$bin" / > report.txt
+          code=$?
+          set -e
+          cat report.txt
+          [ "$code" -ne 2 ] || { echo "php-scan couldn't scan (exit 2)"; exit 1; }
+          if command -v php >/dev/null; then
+            php -v | head -1
+            grep -E 'FOUND binary +php.*PHP [0-9]+\.[0-9]+\.[0-9]+' report.txt
+          fi
+
+  # A scan of a real Mac with Homebrew PHP installed, with the darwin build;
+  # it has to find PHP with a version.
+  test-macos:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: php-scan-darwin-*
+          merge-multiple: true
+      - run: brew install php
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      - name: scan the runner
+        run: |
+          bin=./php-scan-darwin-$(uname -m | sed 's/x86_64/amd64/')
+          chmod +x "$bin"
+          set +e
+          sudo "$bin" / > report.txt
+          code=$?
+          set -e
+          cat report.txt
+          [ "$code" -ne 2 ] || { echo "php-scan couldn't scan (exit 2)"; exit 1; }
+          php -v | head -1
+          grep -E 'FOUND binary +php.*PHP [0-9]+\.[0-9]+\.[0-9]+' report.txt
+
+  image:
+    needs: [test-linux, test-macos]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/bake-action@v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false" # keep the artifacts to the binaries
+        with:
+          push: true
+
+  release:
+    needs: [test-linux, test-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: php-scan-*
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum php-scan-* > SHA256SUMS
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
